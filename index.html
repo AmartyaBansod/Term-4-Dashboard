@@ -109,6 +109,11 @@ select.wsel:focus{border-color:var(--gold);outline:none}
 .tag-post{background:rgba(107,159,255,.2);color:var(--blue)}
 .tag-dbl{background:rgba(114,201,122,.2);color:var(--ls)}
 .tag-inc{background:rgba(232,90,138,.15);color:var(--idt)}
+.tag-conflict{background:rgba(255,107,107,.2);color:var(--red)}
+.tag-resch{background:rgba(245,166,35,.18);color:var(--amber)}
+.sblock-conflict{outline:1.5px solid var(--red);outline-offset:-1px}
+.sblock-resch{box-shadow:inset 0 0 0 1px rgba(245,166,35,.5)}
+.wg-conflict-warn{background:rgba(255,107,107,.08);border:1px solid rgba(255,107,107,.25);color:#ff8080;border-radius:7px;padding:6px 10px;font-size:.65rem;margin-bottom:8px;display:flex;align-items:center;gap:6px}
 .wg-note{font-size:.63rem;color:var(--muted);margin-top:8px}
 /* QUICK PREP */
 .qp-wrap{margin-top:12px;border:1px solid var(--brd);border-radius:9px;overflow:hidden}
@@ -1159,18 +1164,26 @@ function renderWeekly(){
   eb.innerHTML='';
   const DN=['','Mon','Tue','Wed','Thu','Fri'];
   const dates={};for(let i=0;i<5;i++)dates[i+1]=addDays(w.mon,i);
+  // Build the grid by asking the override-aware sessionsForDate() for each day.
+  // This makes Weekly view consistent with Calendar, Summary, and Quick Prep.
   const grid={};for(let d=1;d<=5;d++)grid[d]=Array.from({length:6},()=>[]);
-  REGULAR.forEach(r=>{
-    if(!dates[r.dow])return;
-    if(r.postmid&&!isPost(dates[r.dow]))return;
-    grid[r.dow][r.slot].push({...r,time:SLOT_LBL[r.slot]});
-  });
   for(let d=1;d<=5;d++){
-    const k=ymd(dates[d]);
-    if(IDT_SPECIFIC[k]){
-      for(let s=0;s<6;s++)grid[d][s]=grid[d][s].filter(r=>r.cls!=='idt');
-      const idt=IDT_SPECIFIC[k];
-      grid[d][idt.slot].push({cls:'idt',code:'IDT',name:'IDT – Inclusivity ('+idt.sn+')',venue:idt.venue,fac:idt.fac,type:'Compulsory',period:'Inclusivity'+(idt.note?' · '+idt.note:''),time:idt.time,slot:idt.slot});
+    const dayList=sessionsForDate(dates[d]);
+    dayList.forEach(s=>{
+      if(s.cls==='exam')return;
+      const sl=typeof s.slot==='number'?s.slot:0;
+      if(sl<0||sl>5)return;
+      grid[d][sl].push(s);
+    });
+  }
+  // Conflict detection: any cell with 2+ sessions is a conflict.
+  let conflictCount=0;
+  for(let d=1;d<=5;d++){
+    for(let s=0;s<6;s++){
+      if(grid[d][s].length>1){
+        conflictCount+=grid[d][s].length;
+        grid[d][s].forEach(c=>{c._conflict=true;});
+      }
     }
   }
   let html='<div class="wg-hdr"></div>';
@@ -1186,19 +1199,34 @@ function renderWeekly(){
       html+='<div class="cell">';
       cards.forEach(cv=>{
         const when=DN[d]+', '+fmtS(dates[d])+' · '+(cv.time||SLOT_LBL[s]);
-        html+=`<div class="sblock ${cv.cls}" onclick="openSesModal('${cv.cls}','${esc(cv.name)}','${esc(cv.code)}','${esc(cv.fac)}','${esc(cv.venue)}','${esc(when)}','${esc(cv.type)}',${d},${s},'${ymd(dates[d])}',${cv.cls==='idt'})">
+        // For rescheduled sessions, point the modal at the ORIGINAL dow/slot/date
+        // so that re-rescheduling updates the existing override rather than
+        // creating a phantom new one at the moved-to position.
+        const modalDow=(typeof cv._origDow==='number')?cv._origDow:d;
+        const modalSlot=(typeof cv._origSlot==='number')?cv._origSlot:s;
+        const modalDate=cv._origDate||ymd(dates[d]);
+        const extraCls=(cv._conflict?' sblock-conflict':'')+(cv.rescheduled?' sblock-resch':'');
+        html+=`<div class="sblock ${cv.cls}${extraCls}" onclick="openSesModal('${cv.cls}','${esc(cv.name)}','${esc(cv.code)}','${esc(cv.fac)}','${esc(cv.venue)}','${esc(when)}','${esc(cv.type)}',${modalDow},${modalSlot},'${modalDate}',${cv.cls==='idt'})">
           <div class="sb-code">${cv.code}</div>
           <div class="sb-name">${cv.name}</div>
           <div class="sb-venue">📍 ${cv.venue}</div>
           ${cv.tag==='dbl'?'<span class="stag tag-dbl">↕ Double</span>':''}
           ${cv.tag==='post'?'<span class="stag tag-post">Post-Mid</span>':''}
           ${cv.cls==='idt'&&!cv.postmid?'<span class="stag tag-inc">IDT</span>':''}
+          ${cv.rescheduled?'<span class="stag tag-resch">↷ Rescheduled</span>':''}
+          ${cv._conflict?'<span class="stag tag-conflict">⚠ Conflict</span>':''}
         </div>`;
       });
       html+='</div>';
     }
   }
-  document.getElementById('wk-grid').innerHTML=html;
+  // Prepend a conflict banner if any clashes exist this week.
+  let banner='';
+  if(conflictCount>0){
+    banner=`<div class="wg-conflict-warn">⚠ ${conflictCount} session${conflictCount>1?'s':''} clash in this week. Tap any flagged block to move or cancel it.</div>`;
+  }
+  document.getElementById('wk-grid').innerHTML=banner+html;
+  // Pass override-aware sessions to Quick Prep.
   const allSes=[];
   for(let d=1;d<=5;d++)for(let s=0;s<6;s++)grid[d][s].forEach(cv=>{allSes.push({...cv,dayName:DN[d],date:dates[d]});});
   renderQP(allSes);
@@ -1243,21 +1271,8 @@ function tqp(i){const r=document.getElementById('qpr-'+i),a=document.getElementB
 // ═══════════════════════════════════════════════
 let calIdx=0;
 function setCal(i){calIdx=i;renderCal();}
-function sessionsForDate(dt){
-  if(dt<T_S||dt>T_E)return[];
-  if(isExamWk(dt))return[{cls:'exam',name:dt>=END_S?'End-Term Exam':'Mid-Term Exam',code:'',fac:'',venue:'',type:'',time:'',slot:0}];
-  const dow=dt.getDay()===0?7:dt.getDay();
-  if(dow>5)return[];
-  const k=ymd(dt);let out=[];
-  REGULAR.forEach(r=>{if(r.dow!==dow)return;if(r.postmid&&!isPost(dt))return;out.push({...r,time:SLOT_LBL[r.slot]});});
-  if(IDT_SPECIFIC[k]){
-    out=out.filter(s=>s.cls!=='idt');
-    const idt=IDT_SPECIFIC[k];
-    out.push({cls:'idt',code:'IDT',name:'IDT ('+idt.sn+')',venue:idt.venue,fac:idt.fac,type:'Compulsory',time:idt.time,slot:idt.slot,period:idt.note||''});
-  }
-  out.sort((a,b)=>(SLOT_HH[a.slot]||0)-(SLOT_HH[b.slot]||0));
-  return out;
-}
+// sessionsForDate is defined further down (override-aware version).
+// It is hoisted at parse time so calls from renderCal / renderWS / renderWeekly work.
 function renderCal(){
   const w=WEEKS[calIdx];
   document.getElementById('cal-title').textContent='Week '+(calIdx+1);
@@ -1476,16 +1491,23 @@ function getMovedTo(dateStr){
         if(key.startsWith('idt_')){
           const origD=key.replace('idt_','');
           const base=IDT_SPECIFIC[origD]||{};
+          // Recover original dow from the original IDT date so re-reschedules
+          // resolve back to the same override key 'idt_<origDate>'.
+          let origDow=5;
+          try{const pd=new Date(origD);origDow=pd.getDay()===0?7:pd.getDay();}catch(e){}
           result.push({
             cls:'idt',code:'IDT',
-            name:'IDT – Inclusivity ('+( base.sn||'?')+') ↷ rescheduled',
+            name:'IDT – Inclusivity ('+( base.sn||'?')+')',
             venue:m.newVenue||base.venue||'L-22',
             fac:base.fac||'Varies',
             type:'Compulsory',
             time:m.newTime||(SLOT_LBL[m.newSlot]||base.time||'TBD'),
             slot:typeof m.newSlot==='number'?m.newSlot:5,
             period:'Rescheduled from '+origD,
-            rescheduled:true
+            rescheduled:true,
+            _origDate:origD,
+            _origDow:origDow,
+            _origSlot:typeof base.slot==='number'?base.slot:5
           });
         } else {
           const parts=key.split('_');
@@ -1494,12 +1516,15 @@ function getMovedTo(dateStr){
           if(reg){
             result.push({
               ...reg,
-              name:reg.name+' ↷ rescheduled',
+              name:reg.name,
               venue:m.newVenue||reg.venue,
               time:m.newTime||(SLOT_LBL[m.newSlot]||SLOT_LBL[slot]),
               slot:typeof m.newSlot==='number'?m.newSlot:slot,
               period:'Rescheduled from '+m.origDate,
-              rescheduled:true
+              rescheduled:true,
+              _origDate:m.origDate,
+              _origDow:dow,
+              _origSlot:slot
             });
           }
         }
@@ -1509,8 +1534,7 @@ function getMovedTo(dateStr){
   return result;
 }
 
-// Patch sessionsForDate to respect overrides — called by weekly grid + calendar
-const _origSessForDate = sessionsForDate;
+// Override-aware sessionsForDate — used by Weekly grid, Calendar, Summary, Quick Prep.
 function sessionsForDate(dt){
   if(dt<T_S||dt>T_E)return[];
   if(isExamWk(dt))return[{cls:'exam',name:dt>=END_S?'End-Term Exam':'Mid-Term Exam',code:'',fac:'',venue:'',type:'',time:'',slot:0}];
